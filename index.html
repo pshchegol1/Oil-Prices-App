@@ -26,11 +26,11 @@
   </header>
 
   <!-- Tab Bar -->
-  <nav class="tab-bar">
-    <button class="tab-btn active" data-tab="prices">
+  <nav class="tab-bar" role="tablist">
+    <button class="tab-btn active" data-tab="prices" role="tab" aria-selected="true" aria-controls="tab-prices">
       <span class="tab-icon">◈</span> World's Oil Prices
     </button>
-    <button class="tab-btn" data-tab="charts">
+    <button class="tab-btn" data-tab="charts" role="tab" aria-selected="false" aria-controls="tab-charts">
       <span class="tab-icon">◉</span> Chart Information
     </button>
   </nav>
@@ -44,18 +44,42 @@
       <div class="panel-header">
         <h2 class="panel-title">Global Crude Oil Benchmarks</h2>
         <p class="panel-subtitle">Select an oil grade to explore full market data</p>
-        <div class="filter-bar">
-          <button class="filter-pill active" data-filter="all">All Grades</button>
-          <button class="filter-pill" data-filter="crude">Crude</button>
-          <button class="filter-pill" data-filter="futures">Futures</button>
-          <button class="filter-pill" data-filter="regional">Regional</button>
-        </div>
       </div>
 
       <!-- Market Ticker -->
       <div class="ticker-wrap">
         <div class="ticker-track" id="ticker-track"></div>
       </div>
+
+      <!-- Market Overview -->
+      <div class="overview" id="overview"></div>
+
+      <!-- Toolbar -->
+      <div class="toolbar">
+        <div class="filter-bar" role="group" aria-label="Filter grades">
+          <button class="filter-pill active" data-filter="all" aria-pressed="true">All Grades</button>
+          <button class="filter-pill" data-filter="crude" aria-pressed="false">Crude</button>
+          <button class="filter-pill" data-filter="futures" aria-pressed="false">Futures</button>
+          <button class="filter-pill" data-filter="regional" aria-pressed="false">Regional</button>
+          <button class="filter-pill" data-filter="watchlist" aria-pressed="false">★ Watchlist</button>
+        </div>
+        <div class="toolbar-right">
+          <label class="search-box">
+            <span class="search-icon" aria-hidden="true">⌕</span>
+            <input type="search" id="search-input" placeholder="Search grade, origin, exchange" aria-label="Search grades" autocomplete="off" />
+            <kbd>/</kbd>
+          </label>
+          <select id="sort-select" class="select" aria-label="Sort grades">
+            <option value="default">Sort: Featured</option>
+            <option value="gainers">Top gainers</option>
+            <option value="losers">Top losers</option>
+            <option value="price">Price: high → low</option>
+            <option value="volume">Volume</option>
+            <option value="name">Name A–Z</option>
+          </select>
+        </div>
+      </div>
+      <p class="results-count" id="results-count" aria-live="polite"></p>
 
       <!-- Price Cards Grid -->
       <div class="cards-grid" id="cards-grid"></div>
@@ -75,12 +99,17 @@
           <div class="range-picker">
             <h4>Time Range</h4>
             <div class="range-btns">
-              <button class="range-btn active" data-range="7">7D</button>
-              <button class="range-btn" data-range="30">1M</button>
-              <button class="range-btn" data-range="90">3M</button>
-              <button class="range-btn" data-range="180">6M</button>
-              <button class="range-btn" data-range="365">1Y</button>
+              <button class="range-btn" data-range="7" aria-pressed="false">7D</button>
+              <button class="range-btn active" data-range="30" aria-pressed="true">1M</button>
+              <button class="range-btn" data-range="90" aria-pressed="false">3M</button>
+              <button class="range-btn" data-range="180" aria-pressed="false">6M</button>
+              <button class="range-btn" data-range="365" aria-pressed="false">1Y</button>
             </div>
+          </div>
+
+          <div class="compare-picker">
+            <h4>Compare With</h4>
+            <select id="compare-select" class="select" aria-label="Compare with another grade"></select>
           </div>
 
           <div class="stats-panel" id="stats-panel"></div>
@@ -96,6 +125,7 @@
             <div class="chart-price-display">
               <span class="chart-current-price" id="chart-current-price">$0.00</span>
               <span class="chart-change-badge" id="chart-change-badge"></span>
+              <span class="chart-period-change" id="chart-period-change"></span>
             </div>
           </div>
 
@@ -127,10 +157,15 @@
 
   </main>
 
+  <footer class="site-footer">
+    <span>Prices are simulated for demonstration and are not live market data.</span>
+    <span>Last update <span id="last-updated">—</span></span>
+  </footer>
+
   <!-- Detail Modal -->
   <div class="modal-overlay" id="modal-overlay">
-    <div class="modal" id="modal">
-      <button class="modal-close" id="modal-close">✕</button>
+    <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <button class="modal-close" id="modal-close" aria-label="Close">✕</button>
       <div class="modal-content" id="modal-content"></div>
     </div>
   </div>

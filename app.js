@@ -224,28 +224,43 @@ const OIL_DATA = [
   },
 ];
 
+const HISTORY_DAYS  = 365;
+const WATCHLIST_KEY = 'oilwatch:watchlist';
+const RANGE_LABELS  = { 7: '7 days', 30: '1 month', 90: '3 months', 180: '6 months', 365: '1 year' };
+
 // ── Utility functions ──────────────────────────────────────────────
 
-function generateHistory(basePrice, days, volatility = 0.015) {
-  const data = [];
-  let price = basePrice * (1 - (days / 365) * 0.05 + Math.random() * 0.04);
-  const now = Date.now();
-  for (let i = days; i >= 0; i--) {
-    const date = new Date(now - i * 86400000);
-    const change = (Math.random() - 0.48) * volatility * price;
-    price = Math.max(price + change, basePrice * 0.5);
-    data.push({ date, price: +price.toFixed(2) });
-  }
-  // Ensure last point matches current price
-  data[data.length - 1].price = basePrice;
-  return data;
+// Deterministic PRNG (mulberry32) so each grade's history is stable across renders and reloads
+function seededRandom(seed) {
+  let a = [...seed].reduce((h, c) => Math.imul(h ^ c.charCodeAt(0), 2654435761), 2166136261);
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
-function generateVolume(baseVol, days) {
-  return Array.from({ length: days + 1 }, (_, i) => ({
-    day: i,
-    vol: Math.floor(baseVol * (0.7 + Math.random() * 0.6))
-  }));
+// Random walk backwards from today's price, reflected inside the 52-week range
+function generateHistory(oil, days = HISTORY_DAYS) {
+  const rand  = seededRandom(oil.id);
+  const vol   = oil.price < 10 ? 0.03 : 0.015;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const points = new Array(days + 1);
+  let price = oil.price;
+  for (let i = days; i >= 0; i--) {
+    points[i] = {
+      date:  new Date(today.getTime() - (days - i) * 86400000),
+      price: +price.toFixed(2),
+      vol:   Math.floor(oil.volume * (0.7 + rand() * 0.6)),
+    };
+    price -= (rand() - 0.5) * vol * price;
+    if (price > oil.high52) price = 2 * oil.high52 - price;
+    if (price < oil.low52)  price = 2 * oil.low52 - price;
+  }
+  return points;
 }
 
 function fmt(n, decimals = 2) {
@@ -261,57 +276,169 @@ function fmtPrice(oil) {
 
 function changeClass(v) { return v >= 0 ? 'up' : 'down'; }
 function changeArrow(v) { return v >= 0 ? '▲' : '▼'; }
+function fmtPct(v)      { return `${changeArrow(v)} ${Math.abs(v).toFixed(2)}%`; }
+function fmtChange(v)   { return `${changeArrow(v)} $${Math.abs(v).toFixed(2)}`; }
+function unitOf(oil)    { return oil.currency === 'USD/MMBtu' ? 'MMBtu' : 'bbl'; }
+function byId(id)       { return OIL_DATA.find(o => o.id === id); }
+
+function rangePct(oil) {
+  const pct = (oil.price - oil.low52) / (oil.high52 - oil.low52) * 100;
+  return Math.min(100, Math.max(0, pct));
+}
+
+function rangeBar(oil) {
+  return `
+    <div class="range52" title="Position within 52-week range">
+      <div class="range52-labels">
+        <span>52W L $${fmt(oil.low52)}</span>
+        <span>H $${fmt(oil.high52)}</span>
+      </div>
+      <div class="range52-track"><span class="range52-marker" style="left:${rangePct(oil)}%"></span></div>
+    </div>`;
+}
+
+function flash(el, diff) {
+  if (!diff) return;
+  el.classList.remove('flash-up', 'flash-down');
+  void el.offsetWidth; // restart animation
+  el.classList.add(diff > 0 ? 'flash-up' : 'flash-down');
+}
+
+// ── Watchlist ─────────────────────────────────────────────────────
+function loadWatchlist() {
+  try { return new Set(JSON.parse(localStorage.getItem(WATCHLIST_KEY)) || []); }
+  catch { return new Set(); }
+}
+
+function saveWatchlist() {
+  try { localStorage.setItem(WATCHLIST_KEY, JSON.stringify([...watchlist])); }
+  catch { /* storage unavailable — watchlist lasts for this session only */ }
+}
+
+function toggleWatch(id) {
+  if (watchlist.has(id)) watchlist.delete(id);
+  else watchlist.add(id);
+  saveWatchlist();
+  document.querySelectorAll(`[data-watch="${id}"]`).forEach(syncWatchBtn);
+  if (activeFilter === 'watchlist') renderCards();
+}
+
+function syncWatchBtn(btn) {
+  const on = watchlist.has(btn.dataset.watch);
+  btn.classList.toggle('on', on);
+  btn.setAttribute('aria-pressed', on);
+  btn.title = on ? 'Remove from watchlist' : 'Add to watchlist';
+  const label = btn.querySelector('.watch-label');
+  btn.querySelector('.watch-star').textContent = on ? '★' : '☆';
+  if (label) label.textContent = on ? 'Watching' : 'Add to watchlist';
+}
 
 // ── State ─────────────────────────────────────────────────────────
 let selectedOilId = 'brent';
-let selectedRange  = 30;
-let activeFilter   = 'all';
+let selectedRange = 30;
+let compareOilId  = '';
+let activeFilter  = 'all';
+let searchQuery   = '';
+let sortBy        = 'default';
+let lastFocused   = null;
+const watchlist   = loadWatchlist();
 let priceChart, volumeChart, volatilityChart;
 
-// Simulate live price updates
+OIL_DATA.forEach(oil => {
+  oil.prevClose = +(oil.price - oil.change).toFixed(2);
+  oil.history   = generateHistory(oil);
+});
+
+// Simulate live price updates (moves are proportional so gas and crude behave alike)
 function jitter(oil) {
-  const delta = (Math.random() - 0.49) * 0.12;
-  oil.price      = +(oil.price + delta).toFixed(2);
-  oil.change     = +(oil.change + delta * 0.1).toFixed(2);
-  oil.changePct  = +(oil.change / (oil.price - oil.change) * 100).toFixed(2);
+  const delta    = (Math.random() - 0.5) * oil.price * 0.0015;
+  oil.price      = +Math.max(oil.price + delta, 0.01).toFixed(2);
+  oil.change     = +(oil.price - oil.prevClose).toFixed(2);
+  oil.changePct  = +(oil.change / oil.prevClose * 100).toFixed(2);
+  oil.high52     = Math.max(oil.high52, oil.price);
+  oil.low52      = Math.min(oil.low52, oil.price);
+  oil.history[oil.history.length - 1].price = oil.price;
 }
 
 // ── Clock ─────────────────────────────────────────────────────────
+function timeString(d = new Date()) {
+  return d.toLocaleTimeString('en-US', { hour12: false });
+}
+
 function startClock() {
   const el = document.getElementById('live-clock');
-  function tick() {
-    const now = new Date();
-    el.textContent = now.toLocaleTimeString('en-US', { hour12: false });
-  }
+  function tick() { el.textContent = timeString(); }
   tick();
   setInterval(tick, 1000);
 }
 
+function setLastUpdated() {
+  document.getElementById('last-updated').textContent = timeString();
+}
+
 // ── Tab Navigation ────────────────────────────────────────────────
+function showTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    const on = b.dataset.tab === name;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on);
+  });
+  document.querySelectorAll('.tab-panel').forEach(p => {
+    p.classList.toggle('active', p.id === `tab-${name}`);
+  });
+  // Canvases have no size while their panel is hidden, so draw after it is shown
+  requestAnimationFrame(name === 'charts' ? updateCharts : drawAllSparklines);
+}
+
 function initTabs() {
   document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-      btn.classList.add('active');
-      document.getElementById(`tab-${btn.dataset.tab}`).classList.add('active');
-      if (btn.dataset.tab === 'charts') {
-        setTimeout(() => updateCharts(), 50);
-      }
-    });
+    btn.addEventListener('click', () => showTab(btn.dataset.tab));
   });
 }
 
-// ── Filter Pills ──────────────────────────────────────────────────
-function initFilters() {
+function isTabActive(name) {
+  return document.getElementById(`tab-${name}`).classList.contains('active');
+}
+
+// ── Toolbar: filters, search, sort ────────────────────────────────
+function initControls() {
   document.querySelectorAll('.filter-pill').forEach(pill => {
     pill.addEventListener('click', () => {
-      document.querySelectorAll('.filter-pill').forEach(p => p.classList.remove('active'));
-      pill.classList.add('active');
+      document.querySelectorAll('.filter-pill').forEach(p => {
+        p.classList.toggle('active', p === pill);
+        p.setAttribute('aria-pressed', p === pill);
+      });
       activeFilter = pill.dataset.filter;
       renderCards();
     });
   });
+
+  const search = document.getElementById('search-input');
+  search.addEventListener('input', () => {
+    searchQuery = search.value.trim().toLowerCase();
+    renderCards();
+  });
+
+  document.getElementById('sort-select').addEventListener('change', e => {
+    sortBy = e.target.value;
+    renderCards();
+  });
+
+  // "/" focuses search, like most terminals and dashboards
+  document.addEventListener('keydown', e => {
+    if (e.key !== '/' || e.target.matches('input, select, textarea')) return;
+    e.preventDefault();
+    if (!isTabActive('prices')) showTab('prices');
+    search.focus();
+  });
+
+  // Watch buttons live in cards and the modal; handle them in one place
+  document.addEventListener('click', e => {
+    const btn = e.target.closest('[data-watch]');
+    if (!btn) return;
+    e.stopPropagation();
+    toggleWatch(btn.dataset.watch);
+  }, true);
 }
 
 // ── Ticker ────────────────────────────────────────────────────────
@@ -319,29 +446,83 @@ function renderTicker() {
   const track = document.getElementById('ticker-track');
   const items = [...OIL_DATA, ...OIL_DATA]; // duplicate for seamless loop
   track.innerHTML = items.map(o => `
-    <span class="ticker-item">
+    <span class="ticker-item" data-id="${o.id}">
       <span class="ticker-name">${o.name}</span>
-      <span class="ticker-price">$${fmt(o.price)}</span>
-      <span class="ticker-${changeClass(o.changePct)}">${changeArrow(o.changePct)} ${Math.abs(o.changePct).toFixed(2)}%</span>
+      <span class="ticker-price"></span>
+      <span class="ticker-chg"></span>
     </span>
   `).join('');
+  track.querySelectorAll('.ticker-item').forEach(item => {
+    item.addEventListener('click', () => openModal(byId(item.dataset.id)));
+  });
+  updateTicker();
+}
+
+function updateTicker() {
+  document.querySelectorAll('.ticker-item').forEach(item => {
+    const oil = byId(item.dataset.id);
+    item.querySelector('.ticker-price').textContent = fmtPrice(oil);
+    const chg = item.querySelector('.ticker-chg');
+    chg.className   = `ticker-chg ticker-${changeClass(oil.changePct)}`;
+    chg.textContent = fmtPct(oil.changePct);
+  });
+}
+
+// ── Market Overview ───────────────────────────────────────────────
+function renderOverview() {
+  const sorted  = [...OIL_DATA].sort((a, b) => b.changePct - a.changePct);
+  const top     = sorted[0];
+  const bottom  = sorted[sorted.length - 1];
+  const spread  = byId('brent').price - byId('wti').price;
+  const up      = OIL_DATA.filter(o => o.changePct >= 0).length;
+  const down    = OIL_DATA.length - up;
+
+  document.getElementById('overview').innerHTML = `
+    <button class="ov-tile" data-id="${top.id}">
+      <span class="ov-label">Top Gainer</span>
+      <span class="ov-value">${top.flag} ${top.name}</span>
+      <span class="ov-sub up">${fmtPct(top.changePct)}</span>
+    </button>
+    <button class="ov-tile" data-id="${bottom.id}">
+      <span class="ov-label">Top Loser</span>
+      <span class="ov-value">${bottom.flag} ${bottom.name}</span>
+      <span class="ov-sub ${changeClass(bottom.changePct)}">${fmtPct(bottom.changePct)}</span>
+    </button>
+    <div class="ov-tile">
+      <span class="ov-label">Brent – WTI Spread</span>
+      <span class="ov-value mono">$${fmt(spread)}</span>
+      <span class="ov-sub muted">per barrel</span>
+    </div>
+    <div class="ov-tile">
+      <span class="ov-label">Market Breadth</span>
+      <span class="ov-value mono"><span class="up">${up}▲</span> <span class="down">${down}▼</span></span>
+      <span class="breadth-bar"><span style="width:${up / OIL_DATA.length * 100}%"></span></span>
+    </div>
+  `;
+  document.querySelectorAll('#overview [data-id]').forEach(tile => {
+    tile.addEventListener('click', () => openModal(byId(tile.dataset.id)));
+  });
 }
 
 // ── Sparkline ─────────────────────────────────────────────────────
-function drawSparkline(canvas, oil) {
-  const data = generateHistory(oil.price, 14, 0.012);
-  const prices = data.map(d => d.price);
-  const min = Math.min(...prices);
-  const max = Math.max(...prices);
-  const W = canvas.width  = canvas.offsetWidth  || 220;
-  const H = canvas.height = 36;
+function drawSparkline(canvas, oil, days = 30) {
+  const W = canvas.offsetWidth;
+  const H = canvas.offsetHeight || 36;
+  if (!W) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = W * dpr;
+  canvas.height = H * dpr;
   const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
 
+  const prices = oil.history.slice(-(days + 1)).map(d => d.price);
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
   const color = oil.changePct >= 0 ? '#2ecc8a' : '#e84b4b';
   const pts = prices.map((p, i) => ({
-    x: (i / (prices.length - 1)) * W,
-    y: H - ((p - min) / (max - min || 1)) * (H - 4) - 2
+    x: (i / (prices.length - 1)) * (W - 4),
+    y: H - ((p - min) / (max - min || 1)) * (H - 6) - 3
   }));
 
   // Fill
@@ -361,73 +542,153 @@ function drawSparkline(canvas, oil) {
   pts.forEach(p => ctx.lineTo(p.x, p.y));
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
   ctx.stroke();
+
+  // Last-price dot
+  const last = pts[pts.length - 1];
+  ctx.beginPath();
+  ctx.arc(last.x, last.y, 2.5, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function drawAllSparklines() {
+  document.querySelectorAll('.card-sparkline').forEach(canvas => {
+    drawSparkline(canvas, byId(canvas.dataset.id));
+  });
 }
 
 // ── Cards ─────────────────────────────────────────────────────────
+const SORTERS = {
+  name:    (a, b) => a.name.localeCompare(b.name),
+  price:   (a, b) => b.price - a.price,
+  gainers: (a, b) => b.changePct - a.changePct,
+  losers:  (a, b) => a.changePct - b.changePct,
+  volume:  (a, b) => b.volume - a.volume,
+};
+
+function visibleOils() {
+  const list = OIL_DATA.filter(o => {
+    if (activeFilter === 'watchlist') { if (!watchlist.has(o.id)) return false; }
+    else if (activeFilter !== 'all' && o.type !== activeFilter) return false;
+    return !searchQuery || `${o.name} ${o.origin} ${o.exchange}`.toLowerCase().includes(searchQuery);
+  });
+  return SORTERS[sortBy] ? list.sort(SORTERS[sortBy]) : list;
+}
+
+function watchBtn(oil, withLabel = false) {
+  const on = watchlist.has(oil.id);
+  return `
+    <button class="watch-btn ${on ? 'on' : ''} ${withLabel ? 'btn btn-ghost' : ''}" data-watch="${oil.id}"
+            aria-pressed="${on}" title="${on ? 'Remove from watchlist' : 'Add to watchlist'}">
+      <span class="watch-star">${on ? '★' : '☆'}</span>${withLabel ? `<span class="watch-label">${on ? 'Watching' : 'Add to watchlist'}</span>` : ''}
+    </button>`;
+}
+
 function renderCards() {
   const grid = document.getElementById('cards-grid');
-  const filtered = activeFilter === 'all'
-    ? OIL_DATA
-    : OIL_DATA.filter(o => o.type === activeFilter);
+  const filtered = visibleOils();
+  document.getElementById('results-count').textContent =
+    `${filtered.length} of ${OIL_DATA.length} grades`;
+
+  if (!filtered.length) {
+    grid.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">${activeFilter === 'watchlist' ? '☆' : '⌕'}</div>
+        <p>${activeFilter === 'watchlist' && !searchQuery
+          ? 'Your watchlist is empty. Tap the ☆ on any grade to pin it here.'
+          : 'No grades match your search.'}</p>
+      </div>`;
+    return;
+  }
 
   grid.innerHTML = filtered.map(oil => `
-    <div class="price-card" data-id="${oil.id}">
-      <div class="card-flag">${oil.flag}</div>
+    <article class="price-card" data-id="${oil.id}" tabindex="0" role="button" aria-label="${oil.name} — view details">
       <div class="card-top">
+        <span class="card-flag">${oil.flag}</span>
         <span class="card-name">${oil.name}</span>
-        <span class="card-type-badge">${oil.type.toUpperCase()}</span>
+        <span class="card-type-badge">${oil.type}</span>
+        ${watchBtn(oil)}
       </div>
       <div class="card-price-row">
-        <span class="card-price">$${fmt(oil.price)}</span>
-        <span class="card-unit">/ bbl</span>
+        <span class="card-price" data-value="${oil.price}">${fmtPrice(oil)}</span>
+        <span class="card-unit">/ ${unitOf(oil)}</span>
       </div>
       <span class="card-change ${changeClass(oil.changePct)}">
-        ${changeArrow(oil.changePct)} ${Math.abs(oil.changePct).toFixed(2)}% &nbsp;${changeArrow(oil.changePct)} $${Math.abs(oil.change).toFixed(2)}
+        ${fmtPct(oil.changePct)} <span class="sep">·</span> ${fmtChange(oil.change)}
       </span>
+      <canvas class="card-sparkline" data-id="${oil.id}" aria-hidden="true"></canvas>
+      ${rangeBar(oil)}
       <div class="card-meta">
         <span>${oil.exchange}</span>
         <span>${oil.origin}</span>
       </div>
-      <canvas class="card-sparkline" data-id="${oil.id}"></canvas>
-    </div>
+    </article>
   `).join('');
 
   grid.querySelectorAll('.price-card').forEach(card => {
-    const oil = OIL_DATA.find(o => o.id === card.dataset.id);
-    const canvas = card.querySelector('.card-sparkline');
-    setTimeout(() => drawSparkline(canvas, oil), 0);
+    const oil = byId(card.dataset.id);
     card.addEventListener('click', () => openModal(oil));
+    card.addEventListener('keydown', e => {
+      if (e.target !== card || (e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      openModal(oil);
+    });
   });
+  requestAnimationFrame(drawAllSparklines);
+}
+
+// Live ticks update cards in place so hover, focus and order stay put
+function updateCardPrices() {
+  document.querySelectorAll('.price-card').forEach(card => {
+    const oil     = byId(card.dataset.id);
+    const priceEl = card.querySelector('.card-price');
+    flash(priceEl, oil.price - parseFloat(priceEl.dataset.value));
+    priceEl.dataset.value = oil.price;
+    priceEl.textContent   = fmtPrice(oil);
+
+    const chg = card.querySelector('.card-change');
+    chg.className = `card-change ${changeClass(oil.changePct)}`;
+    chg.innerHTML = `${fmtPct(oil.changePct)} <span class="sep">·</span> ${fmtChange(oil.change)}`;
+    card.querySelector('.range52-marker').style.left = `${rangePct(oil)}%`;
+  });
+  drawAllSparklines();
 }
 
 // ── Modal ─────────────────────────────────────────────────────────
 function openModal(oil) {
+  lastFocused = document.activeElement;
   const content = document.getElementById('modal-content');
   content.innerHTML = `
-    <div class="modal-flag">${oil.flag}</div>
-    <div class="modal-oil-name">${oil.name}</div>
-    <div class="modal-price">$${fmt(oil.price)}</div>
-    <span class="card-change ${changeClass(oil.changePct)}" style="margin-bottom:16px;display:inline-flex">
-      ${changeArrow(oil.changePct)} ${Math.abs(oil.changePct).toFixed(2)}%&nbsp;&nbsp;${changeArrow(oil.changePct)} $${Math.abs(oil.change).toFixed(2)} today
+    <div class="modal-head">
+      <span class="modal-flag">${oil.flag}</span>
+      <div>
+        <h2 class="modal-oil-name" id="modal-title">${oil.name}</h2>
+        <div class="modal-sub">${oil.origin} · ${oil.exchange} · <span class="card-type-badge">${oil.type}</span></div>
+      </div>
+    </div>
+    <div class="modal-price-row">
+      <span class="modal-price">${fmtPrice(oil)}</span>
+      <span class="card-unit">/ ${unitOf(oil)}</span>
+    </div>
+    <span class="card-change ${changeClass(oil.changePct)}">
+      ${fmtPct(oil.changePct)} <span class="sep">·</span> ${fmtChange(oil.change)} today
     </span>
+    <div class="modal-chart">
+      <span class="modal-chart-label">Last 90 days</span>
+      <canvas class="modal-sparkline" aria-hidden="true"></canvas>
+    </div>
     <p class="modal-desc">${oil.desc}</p>
+    ${rangeBar(oil)}
     <div class="modal-grid">
-      <div class="modal-stat">
-        <div class="modal-stat-label">52W High</div>
-        <div class="modal-stat-value">$${fmt(oil.high52)}</div>
-      </div>
-      <div class="modal-stat">
-        <div class="modal-stat-label">52W Low</div>
-        <div class="modal-stat-value">$${fmt(oil.low52)}</div>
-      </div>
       <div class="modal-stat">
         <div class="modal-stat-label">Volume (kbd)</div>
         <div class="modal-stat-value">${(oil.volume / 1000).toFixed(0)}k</div>
       </div>
       <div class="modal-stat">
-        <div class="modal-stat-label">Exchange</div>
-        <div class="modal-stat-value">${oil.exchange}</div>
+        <div class="modal-stat-label">Currency</div>
+        <div class="modal-stat-value">${oil.currency}</div>
       </div>
       ${oil.api ? `
       <div class="modal-stat">
@@ -438,69 +699,150 @@ function openModal(oil) {
         <div class="modal-stat-label">Sulfur Content</div>
         <div class="modal-stat-value">${oil.sulfur}</div>
       </div>` : ''}
-      <div class="modal-stat" style="grid-column:1/-1">
-        <div class="modal-stat-label">Origin</div>
-        <div class="modal-stat-value">${oil.origin}</div>
-      </div>
+    </div>
+    <div class="modal-actions">
+      ${watchBtn(oil, true)}
+      <button class="btn btn-primary" id="modal-chart-btn">Open full chart →</button>
     </div>
   `;
+
+  document.getElementById('modal-chart-btn').addEventListener('click', () => {
+    selectedOilId = oil.id;
+    if (compareOilId === oil.id) compareOilId = '';
+    closeModal();
+    renderOilSelector();
+    showTab('charts');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+
   document.getElementById('modal-overlay').classList.add('open');
+  document.body.classList.add('no-scroll');
+  requestAnimationFrame(() => drawSparkline(content.querySelector('.modal-sparkline'), oil, 90));
+  document.getElementById('modal-close').focus();
 }
 
 function initModal() {
+  const overlay = document.getElementById('modal-overlay');
   document.getElementById('modal-close').addEventListener('click', closeModal);
-  document.getElementById('modal-overlay').addEventListener('click', e => {
-    if (e.target === document.getElementById('modal-overlay')) closeModal();
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) closeModal();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && overlay.classList.contains('open')) closeModal();
   });
 }
 
 function closeModal() {
   document.getElementById('modal-overlay').classList.remove('open');
+  document.body.classList.remove('no-scroll');
+  if (lastFocused && document.contains(lastFocused)) lastFocused.focus();
 }
 
 // ── Oil Selector (Charts Tab) ─────────────────────────────────────
 function renderOilSelector() {
   const container = document.getElementById('oil-selector');
   container.innerHTML = OIL_DATA.map(oil => `
-    <div class="oil-opt ${oil.id === selectedOilId ? 'active' : ''}" data-id="${oil.id}">
+    <button class="oil-opt ${oil.id === selectedOilId ? 'active' : ''}" data-id="${oil.id}"
+            aria-pressed="${oil.id === selectedOilId}">
       <span class="oil-opt-name">${oil.flag} ${oil.name}</span>
-      <span class="oil-opt-chg ${changeClass(oil.changePct)}">${changeArrow(oil.changePct)}${Math.abs(oil.changePct).toFixed(1)}%</span>
-    </div>
+      <span class="oil-opt-right">
+        <span class="oil-opt-price"></span>
+        <span class="oil-opt-chg"></span>
+      </span>
+    </button>
   `).join('');
 
   container.querySelectorAll('.oil-opt').forEach(opt => {
     opt.addEventListener('click', () => {
       selectedOilId = opt.dataset.id;
+      if (compareOilId === selectedOilId) compareOilId = '';
       renderOilSelector();
       updateCharts();
     });
   });
+  updateSelectorPrices();
+  renderCompareSelect();
+}
+
+function updateSelectorPrices() {
+  document.querySelectorAll('.oil-opt').forEach(opt => {
+    const oil = byId(opt.dataset.id);
+    opt.querySelector('.oil-opt-price').textContent = fmtPrice(oil);
+    const chg = opt.querySelector('.oil-opt-chg');
+    chg.className   = `oil-opt-chg ${changeClass(oil.changePct)}`;
+    chg.textContent = `${changeArrow(oil.changePct)}${Math.abs(oil.changePct).toFixed(1)}%`;
+  });
+}
+
+function renderCompareSelect() {
+  const select = document.getElementById('compare-select');
+  select.innerHTML = `<option value="">None</option>` + OIL_DATA
+    .filter(o => o.id !== selectedOilId)
+    .map(o => `<option value="${o.id}" ${o.id === compareOilId ? 'selected' : ''}>${o.name}</option>`)
+    .join('');
+}
+
+function initCompare() {
+  document.getElementById('compare-select').addEventListener('change', e => {
+    compareOilId = e.target.value;
+    updateCharts();
+  });
 }
 
 // ── Charts ─────────────────────────────────────────────────────────
+const CHART_THEME = {
+  grid:    'rgba(42,47,62,0.8)',
+  tick:    '#5a6278',
+  font:    { family: 'DM Mono', size: 10 },
+  tooltip: {
+    backgroundColor: '#1a1e28',
+    borderColor: '#363d52',
+    borderWidth: 1,
+    titleColor: '#8892a4',
+    bodyColor: '#f0f2f8',
+    padding: 10,
+  },
+};
+
+function periodSlice(oil) {
+  return oil.history.slice(-(selectedRange + 1));
+}
+
+// Comparison mode plots % change from the start of the period so grades of any price line up
+function seriesFor(oil, normalize) {
+  const prices = periodSlice(oil).map(d => d.price);
+  return normalize ? prices.map(p => +((p / prices[0] - 1) * 100).toFixed(2)) : prices;
+}
+
+function renderChartHeader(oil) {
+  document.getElementById('chart-current-price').textContent = fmtPrice(oil);
+  const badge = document.getElementById('chart-change-badge');
+  badge.textContent = `${fmtPct(oil.changePct)}  ${fmtChange(oil.change)}`;
+  badge.className   = `chart-change-badge ${changeClass(oil.changePct)}`;
+
+  const prices = periodSlice(oil).map(d => d.price);
+  const periodChg = (prices[prices.length - 1] / prices[0] - 1) * 100;
+  const period = document.getElementById('chart-period-change');
+  period.innerHTML = `<span class="${changeClass(periodChg)}">${fmtPct(periodChg)}</span> over ${RANGE_LABELS[selectedRange]}`;
+}
+
 function updateCharts() {
-  const oil = OIL_DATA.find(o => o.id === selectedOilId);
+  const oil = byId(selectedOilId);
   if (!oil) return;
+  const compareOil = compareOilId ? byId(compareOilId) : null;
 
   // Header
-  document.getElementById('chart-oil-name').textContent = oil.name;
-  document.getElementById('chart-oil-desc').textContent  = oil.desc.slice(0, 100) + '…';
-  document.getElementById('chart-current-price').textContent = `$${fmt(oil.price)}`;
-  const badge = document.getElementById('chart-change-badge');
-  badge.textContent  = `${changeArrow(oil.changePct)} ${Math.abs(oil.changePct).toFixed(2)}%  ${changeArrow(oil.change)} $${Math.abs(oil.change).toFixed(2)}`;
-  badge.className    = `chart-change-badge ${changeClass(oil.changePct)}`;
+  document.getElementById('chart-oil-name').textContent = `${oil.flag} ${oil.name}`;
+  document.getElementById('chart-oil-desc').textContent = oil.desc;
+  renderChartHeader(oil);
 
-  const history = generateHistory(oil.price, selectedRange);
+  const history = periodSlice(oil);
   const labels  = history.map(d => d.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
   const prices  = history.map(d => d.price);
-  const volData = generateVolume(oil.volume, selectedRange);
-  const vols    = volData.map(d => +(d.vol / 1000).toFixed(1));
-
-  const gridColor  = 'rgba(42,47,62,0.8)';
-  const tickColor  = '#5a6278';
-  const tooltipBg  = '#1a1e28';
-  const isUp       = oil.changePct >= 0;
-  const lineColor  = isUp ? '#2ecc8a' : '#e84b4b';
+  const vols    = history.map(d => +(d.vol / 1000).toFixed(1));
+  const isUp    = oil.changePct >= 0;
+  const lineColor = isUp ? '#2ecc8a' : '#e84b4b';
+  const compact   = window.innerWidth < 600;
 
   // ── Price Chart ──────────────────────────────────────────────
   const priceCtx = document.getElementById('price-chart').getContext('2d');
@@ -508,57 +850,69 @@ function updateCharts() {
   grad.addColorStop(0, lineColor + '40');
   grad.addColorStop(1, lineColor + '00');
 
+  const datasets = [{
+    label: oil.name,
+    oilId: oil.id,
+    data: seriesFor(oil, !!compareOil),
+    borderColor: lineColor,
+    backgroundColor: grad,
+    borderWidth: 2,
+    pointRadius: 0,
+    pointHoverRadius: 5,
+    tension: 0.3,
+    fill: !compareOil,
+  }];
+  if (compareOil) {
+    datasets.push({
+      label: compareOil.name,
+      oilId: compareOil.id,
+      data: seriesFor(compareOil, true),
+      borderColor: '#4b8ae8',
+      borderWidth: 2,
+      borderDash: [6, 4],
+      pointRadius: 0,
+      pointHoverRadius: 5,
+      tension: 0.3,
+      fill: false,
+    });
+  }
+
   if (priceChart) priceChart.destroy();
   priceChart = new Chart(priceCtx, {
     type: 'line',
-    data: {
-      labels,
-      datasets: [{
-        label: oil.name,
-        data: prices,
-        borderColor: lineColor,
-        backgroundColor: grad,
-        borderWidth: 2,
-        pointRadius: 0,
-        pointHoverRadius: 5,
-        tension: 0.3,
-        fill: true,
-      }]
-    },
+    data: { labels, datasets },
     options: {
       responsive: true,
       maintainAspectRatio: true,
-      aspectRatio: 3,
+      aspectRatio: compact ? 1.6 : 3,
+      animation: { duration: 400 },
       interaction: { intersect: false, mode: 'index' },
       plugins: {
-        legend: { display: false },
+        legend: {
+          display: !!compareOil,
+          align: 'end',
+          labels: { color: '#8892a4', font: CHART_THEME.font, boxWidth: 14, boxHeight: 2 },
+        },
         tooltip: {
-          backgroundColor: tooltipBg,
-          borderColor: '#363d52',
-          borderWidth: 1,
-          titleColor: '#8892a4',
-          bodyColor: '#f0f2f8',
-          padding: 10,
+          ...CHART_THEME.tooltip,
           callbacks: {
-            label: ctx => ` $${fmt(ctx.raw)}`
+            label: ctx => compareOil
+              ? ` ${ctx.dataset.label}: ${ctx.raw >= 0 ? '+' : ''}${ctx.raw.toFixed(2)}%`
+              : ` $${fmt(ctx.raw)}`
           }
         }
       },
       scales: {
         x: {
-          grid: { color: gridColor },
-          ticks: {
-            color: tickColor,
-            font: { family: 'DM Mono', size: 10 },
-            maxTicksLimit: 8,
-          }
+          grid: { color: CHART_THEME.grid },
+          ticks: { color: CHART_THEME.tick, font: CHART_THEME.font, maxTicksLimit: compact ? 4 : 8 }
         },
         y: {
-          grid: { color: gridColor },
+          grid: { color: CHART_THEME.grid },
           ticks: {
-            color: tickColor,
-            font: { family: 'DM Mono', size: 10 },
-            callback: v => `$${v.toFixed(0)}`
+            color: CHART_THEME.tick,
+            font: CHART_THEME.font,
+            callback: v => compareOil ? `${v}%` : `$${oil.price < 10 ? v.toFixed(2) : v.toFixed(0)}`
           }
         }
       }
@@ -576,8 +930,9 @@ function updateCharts() {
         label: 'Volume (kbd)',
         data: vols,
         backgroundColor: 'rgba(201,168,76,0.3)',
+        hoverBackgroundColor: 'rgba(201,168,76,0.7)',
         borderColor: '#c9a84c',
-        borderWidth: 1,
+        borderWidth: selectedRange > 90 ? 0 : 1,
         borderRadius: 2,
       }]
     },
@@ -585,15 +940,15 @@ function updateCharts() {
       responsive: true,
       maintainAspectRatio: true,
       aspectRatio: 2.5,
-      plugins: { legend: { display: false }, tooltip: {
-        backgroundColor: tooltipBg, borderColor: '#363d52', borderWidth: 1,
-        titleColor: '#8892a4', bodyColor: '#f0f2f8',
-      }},
+      plugins: {
+        legend: { display: false },
+        tooltip: { ...CHART_THEME.tooltip, callbacks: { label: ctx => ` ${ctx.raw}k kbd` } }
+      },
       scales: {
         x: { grid: { display: false }, ticks: { display: false } },
         y: {
-          grid: { color: gridColor },
-          ticks: { color: tickColor, font: { family: 'DM Mono', size: 10 }, callback: v => `${v}k` }
+          grid: { color: CHART_THEME.grid },
+          ticks: { color: CHART_THEME.tick, font: CHART_THEME.font, callback: v => `${v}k` }
         }
       }
     }
@@ -604,11 +959,11 @@ function updateCharts() {
     if (i === 0) return 0;
     return +Math.abs((p - prices[i - 1]) / prices[i - 1] * 100).toFixed(3);
   });
-  const volGrad = priceCtx.createLinearGradient(0, 0, 0, 150);
+  const vixCtx = document.getElementById('volatility-chart').getContext('2d');
+  const volGrad = vixCtx.createLinearGradient(0, 0, 0, 150);
   volGrad.addColorStop(0, '#4b8ae840');
   volGrad.addColorStop(1, '#4b8ae800');
 
-  const vixCtx = document.getElementById('volatility-chart').getContext('2d');
   if (volatilityChart) volatilityChart.destroy();
   volatilityChart = new Chart(vixCtx, {
     type: 'line',
@@ -621,7 +976,7 @@ function updateCharts() {
         backgroundColor: volGrad,
         borderWidth: 1.5,
         pointRadius: 0,
-        tension: 0.4,
+        cubicInterpolationMode: 'monotone',
         fill: true,
       }]
     },
@@ -629,26 +984,40 @@ function updateCharts() {
       responsive: true,
       maintainAspectRatio: true,
       aspectRatio: 2.5,
-      plugins: { legend: { display: false }, tooltip: {
-        backgroundColor: tooltipBg, borderColor: '#363d52', borderWidth: 1,
-        titleColor: '#8892a4', bodyColor: '#f0f2f8',
-        callbacks: { label: ctx => ` ${ctx.raw}%` }
-      }},
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: { display: false },
+        tooltip: { ...CHART_THEME.tooltip, callbacks: { label: ctx => ` ${ctx.raw}%` } }
+      },
       scales: {
         x: { grid: { display: false }, ticks: { display: false } },
         y: {
-          grid: { color: gridColor },
-          ticks: { color: tickColor, font: { family: 'DM Mono', size: 10 }, callback: v => `${v}%` }
+          grid: { color: CHART_THEME.grid },
+          ticks: { color: CHART_THEME.tick, font: CHART_THEME.font, callback: v => `${v}%` }
         }
       }
     }
   });
 
+  renderChartDetails(oil);
+}
+
+// Live tick: move the last point instead of rebuilding the charts
+function refreshPriceChart() {
+  if (!priceChart) return;
+  const normalize = priceChart.data.datasets.length > 1;
+  priceChart.data.datasets.forEach(ds => { ds.data = seriesFor(byId(ds.oilId), normalize); });
+  priceChart.update('none');
+}
+
+function renderChartDetails(oil) {
   // ── Stats Panel ───────────────────────────────────────────────
-  const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
-  const hi  = Math.max(...prices);
-  const lo  = Math.min(...prices);
-  const avgVol = vols.reduce((a, b) => a + b, 0) / vols.length;
+  const history = periodSlice(oil);
+  const prices  = history.map(d => d.price);
+  const avg     = prices.reduce((a, b) => a + b, 0) / prices.length;
+  const hi      = Math.max(...prices);
+  const lo      = Math.min(...prices);
+  const avgVol  = history.reduce((a, d) => a + d.vol, 0) / history.length / 1000;
 
   document.getElementById('stats-panel').innerHTML = `
     <div class="stat-row">
@@ -657,24 +1026,17 @@ function updateCharts() {
     </div>
     <div class="stat-row">
       <span class="stat-label">Period High</span>
-      <span class="stat-value" style="color:var(--green)">$${fmt(hi)}</span>
+      <span class="stat-value up">$${fmt(hi)}</span>
     </div>
     <div class="stat-row">
       <span class="stat-label">Period Low</span>
-      <span class="stat-value" style="color:var(--red)">$${fmt(lo)}</span>
+      <span class="stat-value down">$${fmt(lo)}</span>
     </div>
     <div class="stat-row">
       <span class="stat-label">Avg Volume</span>
       <span class="stat-value">${fmt(avgVol, 0)}k kbd</span>
     </div>
-    <div class="stat-row">
-      <span class="stat-label">52W High</span>
-      <span class="stat-value">$${fmt(oil.high52)}</span>
-    </div>
-    <div class="stat-row">
-      <span class="stat-label">52W Low</span>
-      <span class="stat-value">$${fmt(oil.low52)}</span>
-    </div>
+    ${rangeBar(oil)}
   `;
 
   // ── Info Table ────────────────────────────────────────────────
@@ -685,8 +1047,9 @@ function updateCharts() {
     ...(oil.api    ? [['API Gravity', `${oil.api}°`]] : []),
     ...(oil.sulfur ? [['Sulfur Content', oil.sulfur]]   : []),
     ['Grade Type', oil.type.toUpperCase()],
-    ['Last Price', `$${fmt(oil.price)}`],
-    ['Change', `${changeArrow(oil.change)} $${Math.abs(oil.change).toFixed(2)} (${changeArrow(oil.changePct)}${Math.abs(oil.changePct).toFixed(2)}%)`],
+    ['Last Price', `${fmtPrice(oil)} / ${unitOf(oil)}`],
+    ['Prev. Close', `$${fmt(oil.prevClose)}`],
+    ['Change', `<span class="${changeClass(oil.change)}">${fmtChange(oil.change)} (${fmtPct(oil.changePct)})</span>`],
   ];
 
   document.querySelector('#info-table tbody').innerHTML = rows.map(([label, val]) => `
@@ -698,8 +1061,10 @@ function updateCharts() {
 function initRangeBtns() {
   document.querySelectorAll('.range-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
+      document.querySelectorAll('.range-btn').forEach(b => {
+        b.classList.toggle('active', b === btn);
+        b.setAttribute('aria-pressed', b === btn);
+      });
       selectedRange = +btn.dataset.range;
       updateCharts();
     });
@@ -709,32 +1074,44 @@ function initRangeBtns() {
 // ── Live Updates ──────────────────────────────────────────────────
 function startLiveUpdates() {
   setInterval(() => {
+    if (document.hidden) return;
     OIL_DATA.forEach(oil => jitter(oil));
-    renderTicker();
-    renderCards();
-    renderOilSelector();
-    // Update chart header price only (not full chart redraw)
-    const oil = OIL_DATA.find(o => o.id === selectedOilId);
-    if (oil) {
-      document.getElementById('chart-current-price').textContent = `$${fmt(oil.price)}`;
-      const badge = document.getElementById('chart-change-badge');
-      badge.textContent = `${changeArrow(oil.changePct)} ${Math.abs(oil.changePct).toFixed(2)}%  ${changeArrow(oil.change)} $${Math.abs(oil.change).toFixed(2)}`;
-      badge.className   = `chart-change-badge ${changeClass(oil.changePct)}`;
+    updateTicker();
+    renderOverview();
+    updateCardPrices();
+    updateSelectorPrices();
+    if (isTabActive('charts')) {
+      const oil = byId(selectedOilId);
+      renderChartHeader(oil);
+      renderChartDetails(oil);
+      refreshPriceChart();
     }
+    setLastUpdated();
   }, 4000);
+}
+
+function initResize() {
+  let timer;
+  window.addEventListener('resize', () => {
+    clearTimeout(timer);
+    timer = setTimeout(drawAllSparklines, 150);
+  });
 }
 
 // ── Boot ──────────────────────────────────────────────────────────
 function init() {
   startClock();
+  setLastUpdated();
   initTabs();
-  initFilters();
+  initControls();
   initModal();
   initRangeBtns();
+  initCompare();
+  initResize();
   renderTicker();
+  renderOverview();
   renderCards();
   renderOilSelector();
-  updateCharts();
   startLiveUpdates();
 }
 
